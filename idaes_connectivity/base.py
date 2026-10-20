@@ -51,7 +51,8 @@ except ImportError as err:
 
 # package
 from idaes_connectivity.util import IdaesPaths, UnitIcon, FileServer
-from idaes_connectivity.const import Direction, ComponentNames, DEFAULT_IMAGE_DIR
+from idaes_connectivity.const import Direction, DEFAULT_IMAGE_DIR
+from idaes_connectivity.icons import lookup_unit_icon
 
 __author__ = "Dan Gunter (LBNL)"
 
@@ -98,6 +99,9 @@ class Connectivity:
             Thus each item in this dict describes an arc, or a line in a diagram,
             with a stream connecting two units (usual case) or coming into or out of
             a unit as an unconnected feed or outlet for the flowsheet (possible).
+        stream_ports (dict): Model stream name to (source port name, destination
+            port name). Names are local to each parent unit, including indices.
+            Empty for CSV, tabular, or explicitly supplied connectivity.
     """
 
     #: Default class for a unit
@@ -145,6 +149,8 @@ class Connectivity:
             ValueError: Invalid inputs
         """
         self._unit_classes = {}
+        self._unit_types = {}
+        self.stream_ports = {}
         self._shortened_names = shortened_names
         self._arc_descend = True  # XXX: Maybe make this an option later?
         if units is not None and streams is not None and connections is not None:
@@ -292,6 +298,7 @@ class Connectivity:
             KeyError: If `unit_name` does not correspond to a unit.
         """
         self._unit_classes[unit_name] = class_name
+        self._unit_types.pop(unit_name, None)
 
     def get_unit_class(self, name: str):
         """Get class for a unit.
@@ -305,6 +312,14 @@ class Connectivity:
         # if len(self._unit_classes) == 0:
         #     self._unit_classes = {k: self.DEFAULT_UNIT_CLASS for k in self.units}
         return self._unit_classes[name]
+
+    def get_unit_icon(self, unit_name: str):
+        """Get the registered or bundled icon and port sides for a unit.
+
+        Unknown unit names raise KeyError. Without an icon, svg_path is None.
+        """
+        unit_class = self.get_unit_class(unit_name)
+        return lookup_unit_icon(self._unit_types.get(unit_name, unit_class))
 
     def as_table(self) -> List[List[str]]:
         rows = [self._header.copy()]
@@ -467,13 +482,17 @@ class Connectivity:
         # Main loop, each arc builds one row in `rows`
         for comp in sorted_arcs:
             # Create list of arcs (streams), whether indexed or no
-            if comp.is_indexed:
+            if comp.is_indexed():
                 stream_set = list(comp.values())
             else:
                 stream_set = [comp]
             # Loop through list of streams
             for comp_stream in stream_set:
                 stream_name = comp_stream.name
+                self.stream_ports[stream_name] = (
+                    comp_stream.source.local_name,
+                    comp_stream.dest.local_name,
+                )
                 src, dst = (
                     comp_stream.source.parent_block(),
                     comp_stream.dest.parent_block(),
@@ -484,6 +503,8 @@ class Connectivity:
                 # record the class of the source and dest
                 self._unit_classes[src_name] = self._model_unit_class(src)
                 self._unit_classes[dst_name] = self._model_unit_class(dst)
+                self._unit_types[src_name] = type(src)
+                self._unit_types[dst_name] = type(dst)
                 # add the stream to the rows
                 streams_idx, units_idx = self._add_model_stream(
                     streams_idx,
@@ -766,6 +787,7 @@ class Mermaid(Formatter):
     #:
     #: - direction (str): Diagram direction
     #: - stream_labels (bool): If true, add stream labels
+    #: - port_labels (bool): If true, add source and destination port names
     #: - stream_values (bool): If True, show stream values
     #: - unit_values (bool): If True, show unit values
     #: - unit_class (bool): If True, include name of unit's class in its name
@@ -774,6 +796,7 @@ class Mermaid(Formatter):
     defaults = {
         "direction": "LR",
         "stream_labels": False,
+        "port_labels": False,
         "stream_values": False,
         "unit_values": False,
         "unit_class": False,
@@ -800,6 +823,7 @@ class Mermaid(Formatter):
         self._use_defaults(kwargs)
         self.indent = kwargs["indent"]
         self._stream_labels = kwargs["stream_labels"]
+        self._port_labels = kwargs["port_labels"]
         self._stream_values = kwargs["stream_values"]
         self._unit_values = kwargs["unit_values"]
         self._unit_class = kwargs["unit_class"]
@@ -811,7 +835,6 @@ class Mermaid(Formatter):
         if component_images:
             self._images = self._start_image_server(component_image_dir)
             if self._images:
-                self._comp_names = ComponentNames()
                 self._host = self._image_server.HOST
                 self._port = self._image_server.port
         else:
@@ -877,7 +900,7 @@ class Mermaid(Formatter):
         #   4) key/value but no values, like (1)
         for name, abbr in self._conn.units.items():
             node_name, node_class = self._get_node_info(name)
-            if self._images and (img_url := self._get_url(node_class)):
+            if self._images and (img_url := self._get_url(name)):
                 # image. images don't add key=value pairs (yet)
                 node_str = f'{abbr}@{{ img: "{img_url}", label: {node_name}, h: 50, constraint: "on"}}'
             else:
@@ -905,10 +928,14 @@ class Mermaid(Formatter):
         for s in connections:
             outfile.write(f"{i}{s}\n")
 
-    def _get_url(self, node_class):
-        return (  # returns None if filename=None
-            filename := self._comp_names.get_filename(node_class)
-        ) and f"http://{self._host}:{self._port}/{filename}"
+    def _get_url(self, unit_name):
+        path = self._conn.get_unit_icon(unit_name).svg_path
+        if path is None:
+            return None
+        if path.is_absolute():
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            return f"data:image/svg+xml;base64,{encoded}"
+        return f"http://{self._host}:{self._port}/{path.as_posix()}"
 
     @staticmethod
     def _format_stream_values(data):
@@ -936,16 +963,29 @@ class Mermaid(Formatter):
         for stream_abbr, values in self._conn.connections.items():
             stream_name = stream_name_map[stream_abbr]
             src, tgt = values[0], values[1]
+            ports = (
+                self._conn.stream_ports.get(stream_name) if self._port_labels else None
+            )
+            port_label = " -> ".join(ports) if ports else ""
             if src is not None and tgt is not None:
                 if self._stream_values:
+                    label = self._clean_stream_label(port_label)
                     sv_name = f"{stream_abbr}_V"
                     if sv_name in self._streams_with_values:
-                        connections.append(f"{src} --- {sv_name}")
+                        if port_label:
+                            connections.append(f"{src} -- {label} --- {sv_name}")
+                        else:
+                            connections.append(f"{src} --- {sv_name}")
                         connections.append(f"{sv_name} --> {tgt}")
+                    elif port_label:
+                        connections.append(f"{src} -- {label} -->{tgt}")
                     else:
                         connections.append(f"{src} --> {tgt}")
-                elif self._stream_labels:
-                    label = self._clean_stream_label(stream_name)
+                elif self._stream_labels or port_label:
+                    label = stream_name if self._stream_labels else ""
+                    if port_label:
+                        label = f"{label} ({port_label})" if label else port_label
+                    label = self._clean_stream_label(label)
                     connections.append(f"{src} -- {label} -->{tgt}")
                 else:
                     connections.append(f"{src} --> {tgt}")
@@ -959,7 +999,7 @@ class Mermaid(Formatter):
 
     @staticmethod
     def _clean_stream_label(value: str) -> str:
-        return '"' + value + '"'
+        return '"' + value.replace('"', "#quot;") + '"'
 
     def stop_image_server(self):
         """Stop the image server, if it was started."""

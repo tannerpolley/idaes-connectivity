@@ -70,6 +70,40 @@ idaes-conn --to mermaid --mmdc model_conn.csv -O model_diagram.png
 
 The `--to mermaid` is optional as Mermaid is the default.
 
+## Registering unit icons
+
+Register an SVG for a custom unit class or its fully qualified Python module
+name before rendering. Registrations last for the Python process; registering
+the same key again replaces it.
+
+```python
+from idaes_connectivity import Connectivity, Mermaid, register_unit_icon
+from idaes.models.unit_models import MSContactor
+
+register_unit_icon(MSContactor, "contactor.svg", ports={
+    "aqueous_inlet": "left", "aqueous_outlet": "right",
+    "organic_inlet": "top", "organic_outlet": "bottom",
+})
+conn = Connectivity(input_model=model)
+icon = conn.get_unit_icon("fs.contactor")  # svg_path and ports
+text = Mermaid(conn, component_images=True, port_labels=True).write(None)
+```
+
+Lookup tries the unit's class, its base classes in Python method resolution
+order, then their module names in the same order, then the existing
+`ComponentNames` mapping. If nothing matches, the unit remains a plain box
+(`svg_path=None`). IDAES block classes and their data classes share a registration,
+so an icon applies to both scalar units and indexed unit elements.
+Registered paths are absolute; bundled filenames are relative
+to Mermaid's component image directory. Registered SVGs are embedded in Mermaid
+as data URLs. Port sides are optional hints for diagram consumers; Mermaid does
+not position ports.
+
+`conn.stream_ports` maps each model Arc name to a `(source_port, destination_port)`
+tuple, with port names local to their parent units. CSV and tabular inputs have
+no port metadata. Mermaid's `port_labels=True` adds these names to edges and can
+be combined with `stream_labels=True`. Both options are off by default.
+
 (d2-tool)=
 ## D2
 [Declarative Diagramming (D2)](https://d2lang.com/) describes itself as "A
